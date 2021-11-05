@@ -164,7 +164,6 @@ class GradientDescentAttack(Attack):
                     epoch_error /= len(testset)
                     if epoch_error < success_error:
                        success_error = epoch_error
-                       log('best: %g' % success_error, LogLevel.WARNING)
                        if self.training:
                            success_model = common.torch.clone(forward_model)
                        else:

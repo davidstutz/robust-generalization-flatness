@@ -26,6 +26,8 @@ weight clipping or training procedures as standalone components.
 * [Installation](#installation)
 * [Setup](#setup)
 * [Standalone Usage](#standalone-usage)
+  * [Clean Flatness](#clean-flatness)
+  * [Robust Flatness](#robust-flatness)
 * [Reproduce Experiments](#reproduce-experiments)
   * [Training](#training)
   * [Evaluation](#evaluation)
@@ -146,6 +148,244 @@ To highlight a few of them:
   * PGD and variants - `attacks/batch_gradient_descent.py`
   * AutoAttack - `attacks/batch_auto_attack.py`
 * Computing Hessian eigenvalues and vectors - `common/hessian.py`
+
+In the following, there are some examples of how to compute average- and worst-case flatness on clean and robust
+cross-entropy loss.
+
+**For the below examples, make sure to download CIFAR10 and setup the variables in `common/paths.py` as described above!**
+
+### Clean Flatness
+
+Examples for computing average- and worst-case flatness on the clean loss can be found in `examples/average_flatness.py`
+and `examples/worst_flatness.py`. The following code snippet shows an excerpt for computing average-case flatness:
+
+    # imports ...    
+    # load model
+    state = common.state.State.load(model_file)
+    model = state.model
+    model.eval()
+    if cuda:
+        model = model.cuda()
+    
+    # setup set to compute flatness on
+    # use only one batch for simplicity, in the paper we use 1000 examples instead
+    testset = common.datasets.Cifar10TestSet(indices=numpy.array(list(range(128))))
+    testloader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False)
+    
+    
+    # make sure that no normalization layers are attacked:
+    def no_normalization(model):
+        exclude_layers = ['whiten', 'rebn', 'norm', 'downsample.1', 'bn', 'shortcut.1']
+        n_parameters = len(list(model.parameters()))
+        parameters = dict(model.named_parameters())
+        names = list(parameters.keys())
+        assert len(names) == n_parameters
+        layers = []
+        for i in range(len(names)):
+            if parameters[names[i]].requires_grad:
+                exclude = False
+                for e in exclude_layers:
+                    if names[i].find(e) >= 0:
+                        exclude = True
+                if not exclude:
+                    layers.append(i)
+        return layers
+    
+    
+    # the "weight attack", i.e., random weight perturbations
+    error_rate = 0.5
+    weight_attack = attacks.weights.RandomAttack()
+    weight_attack.epochs = 1
+    weight_attack.initialization = attacks.weights.initializations.LayerWiseL2UniformSphereInitialization(error_rate)
+    weight_attack.norm = attacks.weights.norms.L2Norm()
+    weight_attack.projection = None
+    weight_attack.get_layers = no_normalization
+    
+    # compute clean probabilities on test set and evaluate
+    reference_probabilities = common.test.test(model, testloader, cuda=cuda)
+    reference_evaluation = common.eval.CleanEvaluation(reference_probabilities, testset.labels)
+    
+    # run the weight attack, i.e., compute loss with weight perturbations
+    # we need to manually evaluate each perturbed model
+    writer = common.summary.SummaryWriter()
+    weight_objective = attacks.weights.objectives.UntargetedF0Objective()
+    perturbed_models = common.test.attack_weights(
+        model, testloader, weight_attack, weight_objective, attempts=10, writer=writer, cuda=cuda)
+    evaluations = []
+    for perturbed_model in perturbed_models:
+        perturbed_model.eval()
+        if cuda:
+            perturbed_model = perturbed_model.cuda()
+        probabilities = common.test.test(perturbed_model, testloader, cuda=cuda)
+        evaluations.append(common.eval.AdversarialWeightsEvaluation(reference_probabilities, probabilities, testset.labels))
+    weight_evaluation = common.eval.EvaluationStatistics(evaluations)
+    
+    reference_loss = reference_evaluation.loss()
+    perturbed_loss, _ = weight_evaluation('robust_loss', 'mean')
+    print('reference loss:', reference_loss)
+    print('perturbed loss:', perturbed_loss)
+    print('average-case robust flatness:', perturbed_loss - reference_loss)
+
+Note that the example runs only on one batch of 128 test examples. The essential steps are:
+* Define a "weight attack", i.e., a method to perturb weights; in this case, random perturbations are used.
+* Define a function for selecting the layers to perturb, see `no_normalization`.
+* Evaluate the model on the clean examples without weight perturbations.
+* Run the weight attack, i.e., compute random weight perturbations and evaluate each perturbed model.
+* Compute flatness as the difference of cross-entropy loss of the unperturbed reference model
+  and the mean cross-entropy loss over all perturbed model.
+
+Worst-case flatness can be computed simply by replacing the method for computing weight perturbations:
+
+    error_rate = 0.003
+    attack = attacks.weights.GradientDescentAttack()
+    attack.epochs = 20
+    attack.base_lr = 0.01
+    attack.normalization = attacks.weights.normalizations.LayerWiseRelativeL2Normalization()
+    attack.backtrack = False
+    attack.momentum = 0
+    attack.lr_factor = 1
+    attack.initialization = attacks.weights.initializations.LayerWiseL2UniformNormInitialization(error_rate)
+    attack.norm = attacks.weights.norms.L2Norm()
+    attack.projection = attacks.weights.SequentialProjections([
+        attacks.weights.projections.LayerWiseL2Projection(error_rate)
+    ])
+    attack.get_layers = no_normalization
+
+Note that in both cases, we use a layer-wise and relative L2 initialization and normalization
+(e.g., `attacks.weights.initializations.LayerWiseL2UniformNormInitialization`) which implements the `B_xi(w)`
+ball described in the paper.
+
+### Robust Flatness
+
+Examples for computing average- and worst-case flatness on the **robust** loss can be found in
+`examples/average_robust_flatness.py` and `examples/worst_robust_flatness.py`. An excerpt for computing average-case
+robust flatness is shown below:
+
+    # imports ...
+    # load model
+    state = common.state.State.load(model_file)
+    model = state.model
+    model.eval()
+    if cuda:
+        model = model.cuda()
+    
+    # setup set to compute flatness on
+    # use only one batch for simplicity, in the paper we use 1000 examples instead
+    testset = common.datasets.Cifar10TestSet(indices=numpy.array(list(range(128))))
+    testloader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False)
+    
+    # the PGD attack to compute adversarial examples with
+    epsilon = 0.0314
+    input_attack = attacks.BatchGradientDescent()
+    input_attack.max_iterations = 20
+    input_attack.base_lr = 0.007
+    input_attack.momentum = 0
+    input_attack.c = 0
+    input_attack.lr_factor = 1
+    input_attack.backtrack = False
+    input_attack.normalized = True
+    input_attack.initialization = attacks.initializations.LInfUniformNormInitialization(epsilon)
+    input_attack.projection = attacks.projections.SequentialProjections([
+        attacks.projections.BoxProjection(0, 1),
+        attacks.projections.LInfProjection(epsilon),
+    ])
+    input_attack.norm = attacks.norms.LInfNorm()
+    
+    
+    # make sure that no normalization layers are attacked:
+    def no_normalization(model):
+        exclude_layers = ['whiten', 'rebn', 'norm', 'downsample.1', 'bn', 'shortcut.1']
+        n_parameters = len(list(model.parameters()))
+        parameters = dict(model.named_parameters())
+        names = list(parameters.keys())
+        assert len(names) == n_parameters
+        layers = []
+        for i in range(len(names)):
+            if parameters[names[i]].requires_grad:
+                exclude = False
+                for e in exclude_layers:
+                    if names[i].find(e) >= 0:
+                        exclude = True
+                if not exclude:
+                    layers.append(i)
+        return layers
+    
+    
+    # the "weight attack", i.e., random weight perturbations
+    error_rate = 0.5
+    weight_attack = attacks.weights.RandomAttack()
+    weight_attack.epochs = 1
+    weight_attack.initialization = attacks.weights.initializations.LayerWiseL2UniformSphereInitialization(error_rate)
+    weight_attack.norm = attacks.weights.norms.L2Norm()
+    weight_attack.projection = None
+    weight_attack.get_layers = no_normalization
+    
+    # objectives: maximize cross-entropy loss
+    # SequentialAttack2 runs the weight attack first and then the input attack
+    input_objective = attacks.objectives.UntargetedF0Objective()
+    weight_objective = attacks.weights.objectives.UntargetedF0Objective()
+    attack = attacks.weights_inputs.SequentialAttack2(weight_attack, input_attack)
+    
+    # compute clean probabilities on test set
+    clean_probabilities = common.test.test(model, testloader, cuda=cuda)
+    
+    # run just adversarial examples, i.e., robust loss without weight perturbation
+    writer = common.summary.SummaryWriter()
+    _, reference_probabilities, _ = common.test.attack(
+        model, testloader, input_attack, input_objective, attempts=1, writer=writer, cuda=cuda)
+    
+    # run the weight attack, i.e., compute robust loss with weight perturbations
+    # in the paper, we use 10 attempts instead
+    _, _, probabilities, _ = common.test.attack_weights_inputs(
+        model, testloader, attack, weight_objective, input_objective, attempts=5, writer=writer, cuda=cuda)
+    
+    # for weight perturbations, we take the mean across random weight perturbation
+    # the reference loss is just the robust loss on the separately computed adversarial examples
+    evaluations = []
+    for i in range(probabilities.shape[0]):
+        evaluations.append(common.eval.AdversarialWeightsEvaluation(clean_probabilities, probabilities[i], testset.labels))
+    input_evaluation = common.eval.AdversarialEvaluation(clean_probabilities, reference_probabilities, testset.labels, validation=0)
+    weight_evaluation = common.eval.EvaluationStatistics(evaluations)
+    
+    reference_loss = input_evaluation.robust_loss()
+    perturbed_loss, _ = weight_evaluation('robust_loss', 'mean')
+    print('reference loss:', reference_loss)
+    print('perturbed loss:', perturbed_loss)
+    print('average-case robust flatness:', perturbed_loss - reference_loss)
+
+The essential steps follow the computation of average-case flatness on the clean cross-entropy loss:
+* Define an adversarial example attack, e.g., PGD.
+* Define a weight attack, for example random weight perturbations.
+* Combine both attacks in a sequential manner (apply weight attack first, then compute adversarial examples) - this
+  is done using `SequentialAttack2`.
+* Run the adversarial example attack to obtain the reference robust loss.
+* Run the sequential weight and input attack to obtain the robust loss with weight perturbations; this is achieved
+  by averaging the robust loss per weight perturbation.
+
+For computing worst-case robust flatness, we cannot compute weight perturbations and adversarial examples sequentially.
+Instead, adversarial examples and weight perturbations are optimized jointly. This means that the sequential attack
+in the above example is replaced by:
+
+    error_rate = 0.003
+    attack = attacks.weights_inputs.GradientDescentAttack()
+    attack.epochs = 20
+    attack.weight_initialization = attacks.weights.initializations.LayerWiseL2UniformNormInitialization(error_rate)
+    attack.weight_projection = attacks.weights.projections.SequentialProjections([
+        attacks.weights.projections.LayerWiseL2Projection(error_rate),
+    ])
+    attack.weight_norm = attacks.weights.norms.L2Norm()
+    attack.weight_normalization = attacks.weights.normalizations.LayerWiseRelativeL2Normalization()
+    attack.input_initialization = attacks.initializations.LInfUniformNormInitialization(epsilon)
+    attack.input_projection = attacks.projections.SequentialProjections([
+        attacks.projections.BoxProjection(0, 1),
+        attacks.projections.LInfProjection(epsilon),
+    ])
+    attack.input_norm = attacks.norms.LInfNorm()
+    # this matches the PGD attack above
+    attack.input_normalized = True
+    attack.input_lr = 0.007
+    attack.weight_lr = 0.01
+    attack.get_layers = no_normalization
 
 ## Reproduce Experiments
 
